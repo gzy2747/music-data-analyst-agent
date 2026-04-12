@@ -17,6 +17,8 @@ Multi-agent patterns:
     HypothesisAgent revises if rejected — up to MAX_CRITIC_ROUNDS
   • Iterative Refinement: code-level while-loop in run_eda() checks that
     ≥ 3 findings contain specific numbers; re-runs agent if not met
+  • Parallel Execution: adk_parallel_analyze() runs statistics + correlations
+    simultaneously via ThreadPoolExecutor
 
 Framework: Google ADK (google-adk)
 Model: gemini-2.5-flash via Vertex AI
@@ -73,9 +75,8 @@ MODEL    = "gemini-2.5-flash"
 APP_NAME = "musicanalyst"
 
 # How many critic rounds before we accept whatever we have.
-# Structure: round 0 → generate + critique, round 1 → revise + critique,
-# round 2 → final revision, accept without critique.
-# This means the Critic evaluates TWICE (rounds 0 and 1) before we give up.
+# Round 0 → generate + critique, Round 1 → revise + critique,
+# Round 2 → final revision, accepted without further critique.
 MAX_CRITIC_ROUNDS = 3
 # How many EDA refinement iterations before we stop
 MAX_EDA_ITERATIONS = 3
@@ -152,28 +153,21 @@ def _finding_is_specific(finding: dict) -> bool:
     Return True if a finding contains a concrete measurement with a meaningful unit.
     This is the CODE-LEVEL gate for the iterative refinement loop.
 
-    Rules (ALL must be satisfied by at least one match):
-      - Must contain a number WITH a meaningful unit (%, s, dB, r=, avg, mean, vs)
-      - A bare number like "50 tracks were collected" does NOT qualify —
-        it must express a measured quantity, not just a count of the dataset size.
-      - "tracks average 198s" → PASS  (198s = duration with unit)
-      - "15% higher rank"     → PASS  (% = relative measure)
-      - "r=−0.41 correlation" → PASS  (r= = statistical measure)
-      - "50 collected songs"  → FAIL  (bare dataset-size number, no analytic unit)
-      - "most songs are short"→ FAIL  (no number at all)
+    Rules (at least one must match):
+      - Number + meaningful unit: %, s, dB, r=, avg, mean
+      - Comparative phrasing: "rank 18 vs 21", "65% vs 28%"
+      - Statistical term with a number: "average 198s", "correlation 0.41"
+      - Bare counts like "50 tracks" do NOT qualify.
     """
     text = finding.get("finding", "")
-    # Pattern 1: number + meaningful unit
     has_unit = bool(re.search(
         r'\d+\.?\d*\s*(%|s\b|dB\b|ms\b|r=|avg\b|mean\b)',
         text, re.IGNORECASE
     ))
-    # Pattern 2: comparative phrasing with numbers (e.g. "rank 18 vs 21", "65% vs 28%")
     has_comparison = bool(re.search(
         r'\d+\.?\d*\s*(vs\.?|versus|compared)\s*\d+\.?\d*',
         text, re.IGNORECASE
     ))
-    # Pattern 3: explicit statistical terms with a number attached
     has_stat = bool(re.search(
         r'(average|median|mean|correlation|std|deviation|percentile|quartile)'
         r'.{0,30}\d+\.?\d*',
@@ -201,7 +195,7 @@ def adk_get_track_info(track_name: str, artist_name: str) -> str:
 
 
 def adk_get_tag_top_tracks(tag: str, limit: int = 100) -> str:
-    """Search Deezer for top tracks matching a genre/mood/era tag."""
+    """Search Deezer for top tracks matching a genre/mood/era tag (e.g. 'indie pop', 'electronic', '2010s')."""
     result = get_tag_top_tracks(tag=tag, limit=limit)
     return json.dumps(_sanitize(result), default=str)
 
@@ -213,24 +207,25 @@ def adk_get_artist_top_tracks(artist_name: str, limit: int = 50) -> str:
 
 
 def adk_get_tracks_details(deezer_ids: list[int]) -> str:
-    """Batch-fetch full track details for a list of Deezer track IDs."""
+    """Batch-fetch full track details (BPM, gain, album art, duration) for a list of Deezer track IDs."""
     result = get_tracks_details(deezer_ids=deezer_ids)
     return json.dumps(_sanitize(result), default=str)
 
 
-# ── Analysis tools ────────────────────────────────────────────
+# ── Analysis tools ─────────────────────────────────────────────
+# These read from thread-local cache set by run_eda — no large data params.
 
 def adk_compute_feature_statistics() -> str:
-    """Compute descriptive statistics (mean/median/std/min/max) for duration, gain, rank, popularity."""
+    """Compute descriptive statistics (mean/median/std/min/max) for duration, gain, rank, popularity across all collected tracks."""
     tracks = _get_eda_tracks()
     if not tracks:
-        return json.dumps({"error": "Track cache is empty."})
+        return json.dumps({"error": "Track cache is empty — no data to analyse. Ensure collector ran successfully."})
     result = compute_feature_statistics(tracks_with_features=tracks)
     return json.dumps(_sanitize(result), default=str)
 
 
 def adk_compute_feature_correlations() -> str:
-    """Compute Pearson correlations between features and popularity. Returns strongest predictor."""
+    """Compute Pearson correlations between features (duration, gain, rank) and popularity. Returns strongest predictor."""
     tracks = _get_eda_tracks()
     if not tracks:
         return json.dumps({"error": "Track cache is empty."})
@@ -239,7 +234,7 @@ def adk_compute_feature_correlations() -> str:
 
 
 def adk_detect_clusters(n_clusters: int = 3) -> str:
-    """K-means cluster collected tracks in duration × gain space."""
+    """K-means cluster collected tracks in duration × gain space and label each cluster."""
     tracks = _get_eda_tracks()
     if not tracks:
         return json.dumps({"error": "Track cache is empty."})
@@ -248,7 +243,7 @@ def adk_detect_clusters(n_clusters: int = 3) -> str:
 
 
 def adk_run_python_analysis(code: str) -> str:
-    """Execute custom pandas/numpy code. Pre-injected: df, pd, np, stats. Set result = {...}."""
+    """Execute custom pandas/numpy code against collected track data. Pre-injected variables: df (DataFrame of all tracks), pd, np, stats. Set result = {...} with your findings."""
     tracks = _get_eda_tracks()
     if not tracks:
         return json.dumps({"error": "Track cache is empty."})
@@ -257,7 +252,13 @@ def adk_run_python_analysis(code: str) -> str:
 
 
 def adk_compute_derived_metrics() -> str:
-    """Compute explicit rate, artist diversity, release recency, duration buckets, rank-tier comparisons."""
+    """Compute derived music metrics not in basic statistics:
+    - explicit_content: rate of explicit tracks
+    - artist_diversity: unique artists, top artists by track count
+    - release_recency: avg age in days, % from last 12/24 months
+    - duration_distribution: short (<3min) / medium (3-4min) / long (>4min) buckets
+    - rank_tier_analysis: top-10 vs bottom-10 comparison on duration, gain, popularity
+    No parameters needed — uses cached track data automatically."""
     tracks = _get_eda_tracks()
     if not tracks:
         return json.dumps({"error": "Track cache is empty."})
@@ -268,6 +269,7 @@ def adk_compute_derived_metrics() -> str:
 # ── Chart tools ───────────────────────────────────────────────
 
 def _store_chart(result: dict) -> str:
+    """Store a chart in thread-local cache and return a small ack to the model."""
     if not hasattr(_tl, "charts"):
         _tl.charts = []
     if result.get("chart_b64"):
@@ -287,7 +289,7 @@ def adk_generate_scatter_chart(
     color_by: str = "popularity",
     title: str = "Music Feature Map",
 ) -> str:
-    """Generate a scatter plot of all collected tracks."""
+    """Generate a scatter plot of all collected tracks (default: duration vs gain, colored by popularity). Chart is stored automatically — do NOT copy chart_b64 into your output."""
     result = generate_scatter_chart(
         tracks_with_features=_get_eda_tracks(),
         x_feature=x_feature,
@@ -299,7 +301,9 @@ def adk_generate_scatter_chart(
 
 
 def adk_generate_radar_chart(track_indices: str = "0,1,2", title: str = "Track Feature Comparison") -> str:
-    """Generate a radar chart comparing features of 2-3 tracks."""
+    """Generate a radar chart comparing features of 2-3 tracks from the collected data.
+    track_indices: comma-separated indices, e.g. '0,1,2'.
+    Chart is stored automatically — do NOT copy chart_b64 into your output."""
     cache = _get_eda_tracks()
     indices = [int(i.strip()) for i in track_indices.split(",") if i.strip().isdigit()]
     tracks = [cache[i] for i in indices if i < len(cache)]
@@ -314,7 +318,9 @@ def adk_generate_bar_chart(
     xlabel: str = "",
     ylabel: str = "",
 ) -> str:
-    """Generate a horizontal bar chart."""
+    """Generate a horizontal bar chart. Chart is stored automatically — do NOT copy chart_b64 into your output.
+    labels_json: JSON array of label strings, e.g. '[\"Artist A\",\"Artist B\"]'.
+    values_json: JSON array of numeric values, e.g. '[240, 195]'."""
     labels = labels_json if isinstance(labels_json, list) else json.loads(labels_json)
     values = values_json if isinstance(values_json, list) else json.loads(values_json)
     data = dict(zip(labels, values))
@@ -323,7 +329,9 @@ def adk_generate_bar_chart(
 
 
 def adk_generate_histogram(feature: str, title: str = "", xlabel: str = "", bins: int = 8) -> str:
-    """Generate a histogram of a single feature distribution."""
+    """Generate a histogram of a single feature distribution across all collected tracks.
+    feature: one of 'duration', 'gain', 'rank', 'popularity'.
+    Shows median line; bars colored with app palette. Chart is stored automatically."""
     result = generate_histogram(
         tracks_with_features=_get_eda_tracks(),
         feature=feature,
@@ -335,7 +343,8 @@ def adk_generate_histogram(feature: str, title: str = "", xlabel: str = "", bins
 
 
 def adk_generate_correlation_heatmap(title: str = "Feature Correlation Matrix") -> str:
-    """Generate a Pearson correlation heatmap."""
+    """Generate a Pearson correlation heatmap between duration, gain, rank, and popularity.
+    Diverging colour (coral→teal). Chart is stored automatically — do NOT copy chart_b64 into output."""
     result = generate_correlation_heatmap(
         tracks_with_features=_get_eda_tracks(),
         title=title,
@@ -344,7 +353,10 @@ def adk_generate_correlation_heatmap(title: str = "Feature Correlation Matrix") 
 
 
 def adk_generate_trend_line(periods_json: str, values_json: str, labels_json: str, title: str, ylabel: str) -> str:
-    """Generate a line chart showing how a feature changes across groups/periods."""
+    """Generate a line chart showing how a feature changes across groups/periods. Chart is stored automatically — do NOT copy chart_b64 into your output.
+    periods_json: JSON array of period strings, e.g. '[\"rank 1-10\",\"rank 11-20\"]'.
+    values_json: JSON array of float values.
+    labels_json: JSON array of point label strings."""
     periods     = periods_json  if isinstance(periods_json,  list) else json.loads(periods_json)
     values      = values_json   if isinstance(values_json,   list) else json.loads(values_json)
     labels_list = labels_json   if isinstance(labels_json,   list) else json.loads(labels_json)
@@ -353,16 +365,20 @@ def adk_generate_trend_line(periods_json: str, values_json: str, labels_json: st
     return _store_chart(_sanitize(result))
 
 
-# ── Wikipedia tools ───────────────────────────────────────────
+# ── Wikipedia tools (second data retrieval method) ────────────
 
 def adk_get_artist_wikipedia_summary(artist_name: str) -> str:
-    """Fetch Wikipedia biography and genre description for a music artist."""
+    """Fetch a Wikipedia biography and genre description for a music artist.
+    Returns description, biography extract, and Wikipedia URL.
+    This is a SEPARATE data source from Deezer — uses Wikipedia REST API (no key needed)."""
     result = get_artist_wikipedia_summary(artist_name=artist_name)
     return json.dumps(_sanitize(result), default=str)
 
 
 def adk_get_genre_wikipedia_overview(genre: str) -> str:
-    """Fetch Wikipedia overview for a music genre."""
+    """Fetch a Wikipedia overview for a music genre (e.g. 'hip-hop', 'K-pop', 'electronic').
+    Provides historical and cultural context for genre-focused analyses.
+    Uses Wikipedia REST API — separate from Deezer."""
     result = get_genre_wikipedia_overview(genre=genre)
     return json.dumps(_sanitize(result), default=str)
 
@@ -370,11 +386,13 @@ def adk_get_genre_wikipedia_overview(genre: str) -> str:
 # ── Parallel analysis tool ────────────────────────────────────
 
 def adk_parallel_analyze() -> str:
-    """Run feature statistics AND correlations in parallel via ThreadPoolExecutor."""
+    """Run feature statistics AND feature correlations in PARALLEL using ThreadPoolExecutor.
+    Returns combined results from both analyses simultaneously — faster than calling each separately.
+    Use this as your first EDA step instead of calling statistics and correlations one by one."""
     import concurrent.futures
     tracks = _get_eda_tracks()
     if not tracks:
-        return json.dumps({"error": "Track cache is empty."})
+        return json.dumps({"error": "Track cache is empty — no data to analyse."})
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         f_stats = executor.submit(compute_feature_statistics, tracks)
         f_corr  = executor.submit(compute_feature_correlations, tracks)
@@ -387,7 +405,7 @@ def adk_parallel_analyze() -> str:
 # ── Artifact tool ─────────────────────────────────────────────
 
 def adk_save_artifact(name: str, content: str, kind: str = "markdown") -> str:
-    """Save the final analysis report as a markdown file."""
+    """Save the final analysis report as a markdown file to the artifacts/ directory."""
     result = save_artifact(name=name, content=content, kind=kind)
     return json.dumps(_sanitize(result), default=str)
 
@@ -396,9 +414,10 @@ def adk_save_artifact(name: str, content: str, kind: str = "markdown") -> str:
 # System prompts
 # ──────────────────────────────────────────────────────────────
 
+# ── Version 1's more detailed Collector prompt ────────────────
 COLLECTOR_SYSTEM = """
 You are the MusicCollectorAgent, Step 1 of a music analysis pipeline.
-Your ONLY job is to collect real-world music data from Deezer AND Wikipedia.
+Your ONLY job is to collect real-world music data from Deezer AND Wikipedia based on the user's question.
 
 Data sources:
   1. Deezer (primary) — chart data, audio features, track rankings (no auth needed)
@@ -414,12 +433,15 @@ Instructions:
    - Genre/mood query  → adk_get_tag_top_tracks(tag="...", limit=100)
    - Global chart      → adk_get_top_tracks_chart(limit=100)
    - Artist focus      → adk_get_artist_top_tracks(artist_name="...", limit=50)
-   Each call returns fully enriched tracks (gain, album_art, release_date, explicit).
-3. ALSO fetch Wikipedia context — ONLY when relevant:
-   - Specific artist → adk_get_artist_wikipedia_summary(artist_name="...")
-   - Specific genre  → adk_get_genre_wikipedia_overview(genre="...")
-   - Global charts   → SKIP Wikipedia entirely
+   - Specific track    → adk_get_track_info(track_name="...", artist_name="...")
+   Each call already returns fully enriched tracks (gain, album_art, release_date, explicit).
+3. ALSO fetch Wikipedia context using a SECOND data source — but ONLY when relevant:
+   - If question is about a specific artist → adk_get_artist_wikipedia_summary(artist_name="...")
+   - If question is about a specific genre  → adk_get_genre_wikipedia_overview(genre="...")
+   - If question is about global charts / trending / top hits → SKIP Wikipedia entirely
+   Include any Wikipedia info in collection_notes.
 4. Compute popularity for each track as: popularity = max(0, 100 - rank).
+   If rank is 0 or unavailable, set popularity = 50.
 
 Return ONLY this JSON — no prose, no markdown fences:
 {
@@ -451,6 +473,7 @@ Return ONLY this JSON — no prose, no markdown fences:
 }
 """
 
+# ── Version 1's richer EDA prompt (more chart options, gain field explained) ──
 EDA_SYSTEM = """
 You are the MusicEDAAgent, Step 2 of a music analysis pipeline.
 
@@ -458,30 +481,57 @@ You receive a summary of the collected data (field names + aggregate stats only)
 The FULL track dataset is pre-loaded in the analysis tools — call them directly,
 do NOT ask for raw track data.
 
-Available numeric features: rank, popularity, duration (seconds), gain (dB).
-Also available: release_date (YYYY-MM-DD), explicit (bool), artist (string).
+Available numeric features: rank (chart position, lower=more popular), popularity (0-100),
+duration (seconds), gain (loudness normalization; more negative = naturally louder track).
+Also available: release_date (YYYY-MM-DD string), explicit (bool).
 
 Perform thorough Exploratory Data Analysis. Find SPECIFIC, NON-OBVIOUS patterns.
-Every finding MUST contain at least one concrete number (count, %, seconds, dB, r=).
 Do NOT output generic summaries like "most songs have similar duration."
 DO find things like "tracks shorter than 200s rank 15% higher on average (rank 18 vs 21)."
+The 'gain' field reveals loudness: values like -10 mean the track is very loud (compressed).
+
+IMPORTANT: The analysis tools (statistics, correlations, clusters, scatter chart, radar chart) require
+NO parameters — they automatically operate on all collected tracks. Just call them directly.
 
 ANALYSIS STEPS — follow in order:
-1. Call adk_parallel_analyze() — runs feature statistics AND correlations simultaneously
-2. Call adk_compute_derived_metrics() — explicit rate, artist diversity, release recency,
-   duration buckets, rank-tier comparisons
+1. Call adk_parallel_analyze() — runs feature statistics AND correlations simultaneously (parallel execution)
+2. Call adk_compute_derived_metrics() — gets explicit rate, artist diversity, release recency, duration buckets, rank-tier comparisons
 3. If any |correlation| > 0.15 or interesting pattern found, dig deeper:
-   adk_run_python_analysis(code="result = {'finding': ...}")
+   - adk_run_python_analysis(code="result = {'finding': ...}")
 4. Call adk_detect_clusters(n_clusters=3)
-5. Generate AT LEAST 3 charts — ALWAYS include:
+5. Generate AT LEAST 3 charts (charts are auto-stored — set "charts": [] in output, do NOT include chart_b64):
+
+   ALWAYS generate these two first:
    a. adk_generate_correlation_heatmap(title="Feature Correlation Matrix")
-   b. adk_generate_scatter_chart(x_feature="duration", y_feature="gain", color_by="popularity")
-   Then 1-2 more from histogram, bar_chart, trend_line, radar_chart.
+   b. adk_generate_scatter_chart(x_feature="duration", y_feature="gain", color_by="popularity", title="Duration vs Loudness")
 
-For representative_tracks, pick 6-8 tracks from the track_index provided.
-Copy name, artist, deezer_id EXACTLY. Leave preview_url/deezer_url/album_art empty.
+   Then pick 1-2 more from:
+   c. adk_generate_histogram(feature="duration", title="Duration Distribution", xlabel="Seconds", bins=8)
+   d. adk_generate_histogram(feature="gain", title="Mastering Gain Distribution", xlabel="dB", bins=7)
+   e. adk_generate_bar_chart(labels_json='["Artist A","B"]', values_json='[240,195]', title="Artist Track Count", ylabel="tracks")
+   f. adk_generate_bar_chart with top-10 vs bottom-10 avg features from rank_tier_analysis
+   g. adk_generate_trend_line(periods_json='["rank 1-5","rank 6-10","rank 11-15","rank 16-20","rank 21-25"]', values_json='[...]', labels_json='[...]', title="Feature by Rank Band", ylabel="...")
+   h. adk_generate_radar_chart(track_indices="0,1,2", title="Top Track Feature Comparison")
 
-Formatting: wrap key numbers in **double asterisks** so they render bold.
+6. Keep iterating until >= 3 distinct, specific, numbered findings.
+
+Available metrics to analyse (all computable from Deezer data):
+- duration (seconds): track length
+- gain (dB): loudness proxy — more negative = naturally louder/compressed
+- rank: chart position (1 = most popular), derived from Deezer chart rank
+- popularity: 100 - rank, a 0-100 score
+- explicit (bool): parental advisory flag
+- release_date (YYYY-MM-DD): when the track was released
+- artist: artist name — use for frequency/diversity analysis
+
+For representative_tracks, pick 6-8 tracks that best illustrate your findings.
+CRITICAL: copy name, artist, and deezer_id EXACTLY from the track index provided.
+Leave preview_url, deezer_url, album_art as empty strings — the server will fill them in.
+Prefer tracks where has_preview=true so users can listen.
+
+Formatting rule: in "finding" strings, wrap key numbers, percentages, track names, and artist names
+in **double asterisks** so they render as bold in the UI. Example:
+  "Tracks shorter than **200s** rank **15% higher** on average (**rank 18** vs **21** for longer tracks)."
 
 Output ONLY this JSON (no prose, no fences):
 {
@@ -503,7 +553,11 @@ Output ONLY this JSON (no prose, no fences):
       "deezer_url": "",
       "album_art": "",
       "why_representative": "",
-      "key_features": {"duration": 0, "gain": 0.0, "popularity": 0}
+      "key_features": {
+        "duration": 0,
+        "gain": 0.0,
+        "popularity": 0
+      }
     }
   ],
   "tracks": []
@@ -528,6 +582,7 @@ Return the SAME JSON schema as before — only NEW findings (the orchestrator wi
 Output ONLY valid JSON, no prose, no markdown fences.
 """
 
+# ── Version 1's richer Hypothesis prompt (highlight_tracks with why_this_track) ──
 HYPOTHESIS_SYSTEM = """
 You are the HypothesisAgent (Generator), Step 3 of a music analysis pipeline.
 
@@ -536,21 +591,34 @@ You receive EDA findings and must produce a compelling, data-grounded music hypo
 Rules:
 - Your hypothesis must be SPECIFIC and NON-OBVIOUS.
   BAD:  "Popular songs tend to be energetic and danceable."
-  GOOD: "Loudness (gain) correlates with rank at r=−0.41, but only for tracks under 210s:
-         shorter loud tracks hit the top quartile 65% of the time vs 28% for longer ones."
+  GOOD: "In this dataset, loudness (gain) correlates with rank at r=−0.41, but only for tracks
+         under 210s: shorter loud tracks capture the top quartile 65% of the time vs 28% for longer ones."
 - Every claim must cite a specific number from the EDA findings.
 - Do NOT invent data — only use what EDA found.
 - List 1-2 alternative explanations that could challenge your hypothesis.
-- Wrap key numbers, track names, artist names in **double asterisks** for bold rendering.
-- The "hypothesis" field is MANDATORY — never empty.
+- Formatting: wrap key numbers, track names, artist names, and technical terms in **double asterisks**
+  in "hypothesis", "summary_paragraph", and evidence "point"/"data" fields so they render bold.
+- CRITICAL: The "hypothesis" field is MANDATORY — it must NEVER be empty or null. Even for yes/no
+  questions, after writing direct_answer you MUST still write a full hypothesis explaining the
+  deeper pattern, mechanism, or nuance behind the answer.
 
 Instructions:
-1. If the question is yes/no, write a concise direct_answer (1-2 sentences).
-2. Form ONE clear, non-trivial hypothesis grounded in data numbers.
-3. Pick 5-7 highlight_tracks from the track_index. Copy name/artist/deezer_id EXACTLY.
-   Leave preview_url/deezer_url/album_art empty — server fills them.
-4. Write summary_paragraph as 1-2 SHORT plain-language sentences, NO numbers or jargon.
-5. Call adk_save_artifact to persist the full markdown report.
+1. Review all EDA findings carefully.
+2. If the original question is a yes/no question (e.g. "Are louder tracks more popular?") or asks
+   "what X" (e.g. "What makes a song top the charts?"), write a concise 1-2 sentence direct_answer.
+   Otherwise leave direct_answer as "".
+3. Form ONE clear, non-trivial hypothesis grounded in the data numbers. This field is REQUIRED.
+   Use the pattern: "[Feature/pattern] predicts [outcome] — specifically [number], suggesting [mechanism]."
+4. Pick 5-7 highlight_tracks that best illustrate your hypothesis. Try to pick tracks
+   different from representative_tracks in EDA for variety, but overlap is OK.
+   CRITICAL: copy name, artist, and deezer_id EXACTLY from the track index provided.
+   Leave preview_url, deezer_url, album_art as empty strings — the server fills them in.
+   Prefer tracks where has_preview=true.
+5. Write summary_paragraph as 1-2 SHORT plain-language sentences with NO numbers or jargon —
+   it should feel like telling a friend what you found, not re-stating the hypothesis.
+   BAD: "Tracks with gain > -8.3 dB achieve rank 4.0 vs 6.5 for louder tracks."
+   GOOD: "Right now, newer and slightly less compressed songs are dominating the charts."
+6. Call adk_save_artifact to persist the full markdown report.
 
 Output ONLY this JSON (no prose, no fences):
 {
@@ -558,13 +626,19 @@ Output ONLY this JSON (no prose, no fences):
   "hypothesis": "",
   "confidence": "Low|Medium|High",
   "confidence_reasoning": "",
-  "supporting_evidence": [{"point": "", "data": ""}],
+  "supporting_evidence": [
+    {"point": "", "data": ""}
+  ],
   "alternative_explanations": ["", ""],
-  "summary_paragraph": "",
+  "summary_paragraph": "1-2 plain-language sentences for non-technical readers. NO numbers or jargon.",
   "highlight_tracks": [
     {
-      "name": "", "artist": "", "deezer_id": 0,
-      "preview_url": "", "deezer_url": "", "album_art": "",
+      "name": "",
+      "artist": "",
+      "deezer_id": 0,
+      "preview_url": "",
+      "deezer_url": "",
+      "album_art": "",
       "why_this_track": "",
       "key_features": {"duration": 0, "gain": 0.0, "popularity": 0}
     }
@@ -669,6 +743,7 @@ def _run_adk_agent(
     """
     Run a single ADK agent synchronously.
     Returns (final_text, tool_call_log).
+    progress_cb(tool_name, detail): optional callable invoked on each tool call.
     """
     import asyncio
 
@@ -766,7 +841,7 @@ def _run_adk_agent(
 def _direct_deezer_fallback(question: str) -> dict:
     """
     Python-level Deezer fallback — called when the agent fails to return tracks.
-    Collects up to 100 tracks to ensure a non-trivial dataset.
+    Targets ≥ 50 tracks for a non-trivial dataset.
     """
     q = question.lower()
 
@@ -814,12 +889,10 @@ def _direct_deezer_fallback(question: str) -> dict:
                 "collection_notes": "Collected via Python fallback (artist top tracks).",
             }
 
-    # ── Global chart keywords ─────────────────────────────────
     global_keywords = ["global", "top", "chart", "hit", "popular", "trending",
                        "billboard", "worldwide", "right now", "current"]
     is_global = any(kw in q for kw in global_keywords)
 
-    # ── Genre/mood ────────────────────────────────────────────
     genre_keywords = ["pop", "hip.hop", "rap", "rock", "jazz", "electronic", "country",
                       "r&b", "soul", "metal", "indie", "chill", "sad", "happy", "dance",
                       "edm", "classical", "latin", "k.pop", "reggae"]
@@ -839,7 +912,6 @@ def _direct_deezer_fallback(question: str) -> dict:
                 "collection_notes": "Collected via Python fallback (genre search).",
             }
 
-    # ── Default: global top chart ─────────────────────────────
     result = get_top_tracks_chart(limit=100, page=1)
     if result.get("tracks"):
         tracks = result["tracks"]
@@ -889,21 +961,12 @@ def run_collector(question: str, progress_cb=None) -> tuple[dict, list[dict]]:
 def _build_eda_initial_msg(question: str, tracks: list[dict]) -> str:
     """
     Build the EDA agent's initial message.
-
-    CRITICAL DESIGN: We do NOT dump the full track list into the message.
-    Instead we send only:
-      - field names (schema)
-      - aggregate summary stats (min/max/mean for key fields)
-      - a compact track index with just id/name/artist/rank for representative_track selection
-    The full data is pre-loaded in thread-local cache and accessed via tool calls.
-    This keeps the context lean and forces the agent to use analysis tools.
+    Sends only schema + aggregate stats + compact track index.
+    Full data is in thread-local cache accessed via tool calls.
     """
     n = len(tracks)
-
-    # Schema only — field names, no values
     schema_fields = list(tracks[0].keys()) if tracks else []
 
-    # Aggregate summary — a few lines of stats the agent can orient itself with
     durations = [t.get("duration", 0) for t in tracks if t.get("duration")]
     gains     = [t.get("gain", 0)     for t in tracks if t.get("gain") is not None]
     ranks     = [t.get("rank", 0)     for t in tracks if t.get("rank")]
@@ -919,9 +982,6 @@ def _build_eda_initial_msg(question: str, tracks: list[dict]) -> str:
         f"rank:         {_rng(ranks)}"
     )
 
-    # Compact track index — ONLY for representative_track/highlight_track selection.
-    # Capped at 20 entries: the agent uses tools to analyse all 100 tracks,
-    # it only needs a short sample list to name representative_tracks from.
     _INDEX_CAP = 20
     track_index = [
         {
@@ -964,7 +1024,6 @@ def _build_eda_refinement_msg(
     }
     missing = all_categories - covered_categories
 
-    # Same lean context: schema + stats only, NO full track dump
     n = len(tracks)
     schema_fields = list(tracks[0].keys()) if tracks else []
     durations = [t.get("duration", 0) for t in tracks if t.get("duration")]
@@ -1009,9 +1068,6 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
       - If < MIN_SPECIFIC_FINDINGS, run a refinement agent pass with gap context
       - Repeat up to MAX_EDA_ITERATIONS times
       - Merge findings across iterations; deduplicate by text
-
-    Full track data is stored in thread-local cache and NEVER dumped into
-    the agent message — only schema + aggregate stats are passed as context.
     """
     tracks = collected.get("tracks", [])
     if not tracks:
@@ -1027,7 +1083,6 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
             "charts": [], "representative_tracks": [], "tracks": [],
         }, []
 
-    # Pre-load full data into thread-local cache (analysis tools read from here)
     _set_eda_tracks(tracks)
     _reset_charts_cache()
 
@@ -1042,15 +1097,13 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
     all_logs.extend(logs)
     result = _parse_json(text)
     final_result = result
-    new_findings = result.get("findings", [])
-    all_findings.extend(new_findings)
+    all_findings.extend(result.get("findings", []))
 
     # ── CODE-LEVEL refinement while-loop ──────────────────────
     iteration = 0
     while iteration < MAX_EDA_ITERATIONS:
         specific = [f for f in all_findings if _finding_is_specific(f)]
         if len(specific) >= MIN_SPECIFIC_FINDINGS:
-            # Stopping condition met — enough specific findings
             break
 
         iteration += 1
@@ -1081,14 +1134,12 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
         ref_result = _parse_json(ref_text)
         new_findings = ref_result.get("findings", [])
 
-        # Deduplicate: skip findings whose text is already in all_findings
         existing_texts = {f.get("finding", "").strip().lower() for f in all_findings}
         for f in new_findings:
             if f.get("finding", "").strip().lower() not in existing_texts:
                 all_findings.append(f)
                 existing_texts.add(f.get("finding", "").strip().lower())
 
-        # Carry over representative_tracks from refinement pass if initial was empty
         if not final_result.get("representative_tracks") and ref_result.get("representative_tracks"):
             final_result["representative_tracks"] = ref_result["representative_tracks"]
 
@@ -1099,12 +1150,10 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
     final_result["findings"] = all_findings
     final_result["eda_iterations"] = iteration + 1
 
-    # Inject charts from thread-local cache
     charts = _get_eda_charts()
     if charts:
         final_result["charts"] = charts
 
-    # Pass-through full tracks for hypothesis stage
     if not final_result.get("tracks"):
         final_result["tracks"] = collected.get("tracks", [])
 
@@ -1112,11 +1161,7 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
 
 
 def _extract_numbers(text: str) -> set[str]:
-    """
-    Extract all numeric strings from text.
-    Returns original string form + rounded variants for fuzzy matching.
-    e.g. "198.3" → {"198.3", "198.3", "198"}
-    """
+    """Extract all numeric strings from text with rounded variants for fuzzy matching."""
     raw_nums = re.findall(r'-?\d+\.?\d*', text)
     result: set[str] = set()
     for n in raw_nums:
@@ -1136,58 +1181,34 @@ def _verify_hypothesis_grounding(
 ) -> tuple[bool, list[str]]:
     """
     CODE-LEVEL grounding check — deterministic Python, no LLM involved.
-
-    Extracts all numbers from EDA findings (the ground-truth pool), then checks
-    whether numbers cited in the hypothesis text can be found in that pool.
-
-    A number is considered "unverified" if:
-      - It appears in the hypothesis or supporting_evidence
-      - It is >= 4 in absolute value (filters out sequence numbers like 1, 2, 3)
-      - It cannot be found in any EDA finding text or evidence dict
-
+    Checks that numbers cited in the hypothesis appear in EDA findings.
     Returns (is_grounded, unverified_numbers).
     is_grounded = True when unverified_ratio < 0.5
-    (50% threshold tolerates legitimately derived numbers like percentages
-    computed from two EDA values — e.g. "17% shorter" derived from 198s vs 240s)
     """
-    # Build EDA number pool from all findings text + evidence dicts
     eda_text = " ".join(
         f.get("finding", "") + " " + json.dumps(f.get("evidence", {}), default=str)
         for f in eda_findings
     )
     eda_pool = _extract_numbers(eda_text)
 
-    # Collect hypothesis text to verify
     hyp_text = hypothesis.get("hypothesis", "")
     for ev in hypothesis.get("supporting_evidence", []):
         hyp_text += " " + ev.get("point", "") + " " + ev.get("data", "")
 
     hyp_numbers = _extract_numbers(hyp_text)
-
-    # Only check "meaningful" numbers (>= 4 in absolute value)
     meaningful = {n for n in hyp_numbers if abs(float(n)) >= 4}
-
     unverified = [n for n in meaningful if n not in eda_pool]
 
-    # Accept if ≤ 50% of cited numbers are unverifiable
     ratio = len(unverified) / max(len(meaningful), 1)
-    is_grounded = ratio < 0.5
-
-    return is_grounded, unverified
+    return ratio < 0.5, unverified
 
 
 def _build_hyp_msg(question: str, eda_result: dict, collected: dict) -> str:
-    """
-    Build the hypothesis agent's message.
-    Strips chart blobs and full track data to save tokens.
-    Passes EDA findings + a compact track index.
-    """
+    """Build the hypothesis agent's message. Strips chart blobs to save tokens."""
     trimmed_eda = {k: v for k, v in eda_result.items() if k not in ("charts", "tracks")}
     payload = json.dumps(_sanitize(trimmed_eda), default=str)[:10000]
 
     tracks = collected.get("tracks", [])
-    # Cap at 20: HypothesisAgent only needs to pick 5-7 tracks; 20 is more than enough.
-    # Sending all 100 wastes ~2000 tokens with no benefit.
     _HYP_INDEX_CAP = 20
     track_index = [
         {
@@ -1219,19 +1240,13 @@ def run_hypothesis(
     """
     Step 3 — Hypothesize.
 
-    TRUE Generator-Critic pattern with feedback loop:
-      Round 0: HypothesisAgent generates hypothesis
+    Generator-Critic pattern with feedback loop:
+      Round 0: HypothesisAgent generates
                → CODE-LEVEL grounding check (_verify_hypothesis_grounding)
                → HypothesisCriticAgent evaluates (ACCEPT / REJECT)
-               → If REJECT from either: HypothesisAgent revises with feedback
-      Round 1: HypothesisAgent revises
-               → CODE-LEVEL grounding check
-               → HypothesisCriticAgent re-evaluates
+               → If REJECT: HypothesisAgent revises with feedback
+      Round 1: Revision → grounding check → critic re-evaluates
       Round 2: Final revision, accepted regardless.
-
-    The grounding check is deterministic Python — it extracts numbers from EDA
-    findings and verifies that numbers cited in the hypothesis are actually present
-    in the data. This is NOT an LLM check.
     """
     all_logs: list[dict] = []
     hypothesis: dict = {}
@@ -1245,7 +1260,6 @@ def run_hypothesis(
         if round_num == 0:
             gen_msg = hyp_msg
         else:
-            # Critic or grounding check rejected — inject feedback for revision
             gen_msg = (
                 f"Your previous hypothesis was REJECTED.\n\n"
                 f"Issues:\n{json.dumps(critique.get('issues', []), indent=2)}\n\n"
@@ -1275,7 +1289,7 @@ def run_hypothesis(
         all_logs.extend(gen_logs)
         hypothesis = _parse_json(gen_text)
 
-        # ── Skip critic+grounding on the final round — accept as-is ──
+        # Skip critic on final round — accept as-is
         if round_num >= MAX_CRITIC_ROUNDS - 1:
             break
 
@@ -1283,7 +1297,6 @@ def run_hypothesis(
         is_grounded, unverified = _verify_hypothesis_grounding(hypothesis, eda_findings)
 
         if not is_grounded:
-            # Grounding failed — build critique directly without calling Critic LLM
             critique = {
                 "verdict": "REJECT",
                 "issues": [
@@ -1304,10 +1317,9 @@ def run_hypothesis(
                     )
                 except Exception:
                     pass
-            # Skip LLM Critic this round — grounding failure is enough to reject
-            continue
+            continue  # Skip LLM critic this round
 
-        # ── LLM Critic pass (only reached if grounding check passed) ──
+        # ── LLM Critic pass (only if grounding check passed) ──────────
         critic_msg = (
             f"EDA findings (ground truth):\n"
             f"{json.dumps(_sanitize(eda_findings), default=str)}\n\n"
@@ -1332,16 +1344,13 @@ def run_hypothesis(
         verdict = critique.get("verdict", "ACCEPT").upper()
         if progress_cb:
             try:
-                progress_cb(
-                    "hypothesis_verdict",
-                    f"round {round_num + 1} verdict: {verdict}",
-                )
+                progress_cb("hypothesis_verdict", f"round {round_num + 1} verdict: {verdict}")
             except Exception:
                 pass
 
         if verdict == "ACCEPT":
             break
-        # If REJECT, loop continues — next round uses critique feedback above
+        # REJECT → loop continues with critique feedback
 
     return hypothesis, all_logs
 
