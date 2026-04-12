@@ -600,46 +600,6 @@ Output ONLY this JSON (no prose, no fences):
 """
 
 
-def _finding_is_specific(finding: dict) -> bool:
-    """
-    Return True if a finding contains a concrete measurement with a meaningful unit.
-    CODE-LEVEL gate for the iterative refinement loop.
-    """
-    import re
-    text = finding.get("finding", "")
-
-
-    # Pattern 1: number + meaningful unit (with optional whitespace before unit)
-    has_unit = bool(re.search(
-        r'\d+\.?\d*\s*(%|seconds?|s\b|dB\b|ms\b)',
-        text, re.IGNORECASE
-    )) or bool(re.search(
-        r'r\s*=\s*-?\d+\.?\d*',   # r = -0.41 or r=-0.41
-        text, re.IGNORECASE
-    ))
-
-    # Pattern 2: comparative phrasing with numbers
-    has_comparison = bool(re.search(
-        r'\d+\.?\d*\s*(vs\.?|versus|compared\s+to)\s*\d+\.?\d*',
-        text, re.IGNORECASE
-    ))
-
-    # Pattern 3: statistical terms followed by a number (within 40 chars)
-    has_stat = bool(re.search(
-        r'(average|avg|median|mean|correlation|std|deviation|percentile|quartile|rate|pct|percent)'
-        r'.{0,40}\d+\.?\d*',
-        text, re.IGNORECASE
-    ))
-
-    # Pattern 4: number followed by statistical context
-    has_stat_reverse = bool(re.search(
-        r'\d+\.?\d*\s*(tracks?|songs?|artists?)\s+(are|have|show|rank)',
-        text, re.IGNORECASE
-    ))
-
-    return has_unit or has_comparison or has_stat or has_stat_reverse
-
-
 
 # ── Refinement prompt — injected when the while-loop triggers a re-run ──────
 EDA_REFINEMENT_SYSTEM = """
