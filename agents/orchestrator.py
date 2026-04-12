@@ -26,6 +26,7 @@ Auth: Application Default Credentials (gcloud auth application-default login)
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -149,43 +150,36 @@ def _parse_json(text: str) -> dict:
 def _finding_is_specific(finding: dict) -> bool:
     """
     Return True if a finding contains a concrete measurement with a meaningful unit.
-    CODE-LEVEL gate for the iterative refinement loop.
+    This is the CODE-LEVEL gate for the iterative refinement loop.
+
+    Rules (ALL must be satisfied by at least one match):
+      - Must contain a number WITH a meaningful unit (%, s, dB, r=, avg, mean, vs)
+      - A bare number like "50 tracks were collected" does NOT qualify —
+        it must express a measured quantity, not just a count of the dataset size.
+      - "tracks average 198s" → PASS  (198s = duration with unit)
+      - "15% higher rank"     → PASS  (% = relative measure)
+      - "r=−0.41 correlation" → PASS  (r= = statistical measure)
+      - "50 collected songs"  → FAIL  (bare dataset-size number, no analytic unit)
+      - "most songs are short"→ FAIL  (no number at all)
     """
-    import re
     text = finding.get("finding", "")
-
-
-    # Pattern 1: number + meaningful unit (with optional whitespace before unit)
+    # Pattern 1: number + meaningful unit
     has_unit = bool(re.search(
-        r'\d+\.?\d*\s*(%|seconds?|s\b|dB\b|ms\b)',
-        text, re.IGNORECASE
-    )) or bool(re.search(
-        r'r\s*=\s*-?\d+\.?\d*',   # r = -0.41 or r=-0.41
+        r'\d+\.?\d*\s*(%|s\b|dB\b|ms\b|r=|avg\b|mean\b)',
         text, re.IGNORECASE
     ))
-
-    # Pattern 2: comparative phrasing with numbers
+    # Pattern 2: comparative phrasing with numbers (e.g. "rank 18 vs 21", "65% vs 28%")
     has_comparison = bool(re.search(
-        r'\d+\.?\d*\s*(vs\.?|versus|compared\s+to)\s*\d+\.?\d*',
+        r'\d+\.?\d*\s*(vs\.?|versus|compared)\s*\d+\.?\d*',
         text, re.IGNORECASE
     ))
-
-    # Pattern 3: statistical terms followed by a number (within 40 chars)
+    # Pattern 3: explicit statistical terms with a number attached
     has_stat = bool(re.search(
-        r'(average|avg|median|mean|correlation|std|deviation|percentile|quartile|rate|pct|percent)'
-        r'.{0,40}\d+\.?\d*',
+        r'(average|median|mean|correlation|std|deviation|percentile|quartile)'
+        r'.{0,30}\d+\.?\d*',
         text, re.IGNORECASE
     ))
-
-    # Pattern 4: number followed by statistical context
-    has_stat_reverse = bool(re.search(
-        r'\d+\.?\d*\s*(tracks?|songs?|artists?)\s+(are|have|show|rank)',
-        text, re.IGNORECASE
-    ))
-
-    return has_unit or has_comparison or has_stat or has_stat_reverse
-
-
+    return has_unit or has_comparison or has_stat
 
 
 # ──────────────────────────────────────────────────────────────
@@ -457,8 +451,6 @@ Return ONLY this JSON — no prose, no markdown fences:
 }
 """
 
-
-
 EDA_SYSTEM = """
 You are the MusicEDAAgent, Step 2 of a music analysis pipeline.
 
@@ -471,101 +463,20 @@ Also available: release_date (YYYY-MM-DD), explicit (bool), artist (string).
 
 Perform thorough Exploratory Data Analysis. Find SPECIFIC, NON-OBVIOUS patterns.
 Every finding MUST contain at least one concrete number (count, %, seconds, dB, r=).
-Do NOT output generic summaries like “most songs have similar duration.”
-DO find things like “tracks shorter than 200s rank 15% higher on average (rank 18 vs 21).”
+Do NOT output generic summaries like "most songs have similar duration."
+DO find things like "tracks shorter than 200s rank 15% higher on average (rank 18 vs 21)."
 
-═══════════════════════════════════════════════════════════════
-STEP A — ALWAYS run these two calls first (parallel):
-
-1. adk_parallel_analyze()         ← stats + correlations simultaneously
-1. adk_compute_derived_metrics()  ← explicit rate, recency, duration buckets, rank-tiers
-   ═══════════════════════════════════════════════════════════════
-
-═══════════════════════════════════════════════════════════════
-STEP B — ADAPT based on the question type (read the original question carefully):
-
-IF question asks about a SPECIFIC ARTIST (e.g. “Taylor Swift”, “The Weeknd”):
-
-- Focus: How consistent is this artist's sound? Do longer/louder tracks rank higher?
-- Required extra calls:
-  adk_run_python_analysis(code=”””
-  result = {
-  'duration_std': float(df['duration'].std()),
-  'gain_std': float(df['gain'].std()),
-  'duration_rank_corr': float(df[['duration','rank']].corr().iloc[0,1]),
-  'gain_rank_corr': float(df[['gain','rank']].corr().iloc[0,1]),
-  'release_years': df['release_date'].str[:4].value_counts().head(5).to_dict(),
-  }
-  “””)
-- Chart focus: scatter(x=duration, y=gain, color_by=rank) + histogram(feature=duration)
-
-IF question asks about a GENRE or MOOD (e.g. “hip-hop”, “indie pop”, “Latin”):
-
-- Focus: What audio signature defines charting tracks in this genre?
-- Required extra calls:
-  adk_detect_clusters(n_clusters=3)
-  adk_run_python_analysis(code=”””
-  result = {
-  'explicit_by_rank_tier': {
-  'top25_explicit_pct': float(df[df['rank']<=25]['explicit'].mean()*100),
-  'bottom25_explicit_pct': float(df[df['rank']>df['rank'].quantile(0.75)]['explicit'].mean()*100),
-  },
-  'duration_by_cluster': df.groupby(df['duration'].apply(
-  lambda x: 'short' if x<180 else ('medium' if x<240 else 'long')
-  ))['popularity'].mean().to_dict(),
-  }
-  “””)
-- Chart focus: correlation heatmap + bar chart of cluster avg popularity
-
-IF question is a YES/NO or COMPARISON (e.g. “Are shorter songs more popular?”):
-
-- Focus: Directly test the stated hypothesis with data.
-- Required extra calls:
-  adk_run_python_analysis(code=”””
-  import numpy as np
-  median_dur = df['duration'].median()
-  short = df[df['duration'] < median_dur]
-  long_ = df[df['duration'] >= median_dur]
-  result = {
-  'median_duration_seconds': float(median_dur),
-  'short_track_avg_rank': float(short['rank'].mean()),
-  'long_track_avg_rank': float(long_['rank'].mean()),
-  'short_track_count': int(len(short)),
-  'long_track_count': int(len(long_)),
-  'rank_difference': float(long_['rank'].mean() - short['rank'].mean()),
-  'short_wins': bool(short['rank'].mean() < long_['rank'].mean()),
-  }
-  “””)
-- Chart focus: histogram(feature=duration) + scatter(x=duration, y=rank)
-
-IF question asks about GLOBAL CHARTS or CURRENT TRENDS (no specific artist/genre):
-
-- Focus: What cross-genre patterns dominate the chart right now?
-- Required extra calls:
-  adk_detect_clusters(n_clusters=4)
-  adk_run_python_analysis(code=”””
-  result = {
-  'top10_vs_bottom10_duration': {
-  'top10_avg_s': float(df.nsmallest(10,'rank')['duration'].mean()),
-  'bottom10_avg_s': float(df.nlargest(10,'rank')['duration'].mean()),
-  },
-  'explicit_rate_pct': float(df['explicit'].mean()*100),
-  'recency': {
-  'last_12mo_pct': float((df['release_date'] >= '2024-01-01').mean()*100),
-  },
-  'gain_quartile_popularity': df.groupby(
-  df['gain'].apply(lambda g: 'loud' if g < -10 else ('medium' if g < -7 else 'quiet'))
-  )['popularity'].mean().to_dict(),
-  }
-  “””)
-- Chart focus: correlation heatmap + scatter(x=duration, y=gain, color_by=popularity)
-  ═══════════════════════════════════════════════════════════════
-
-STEP C — Always generate AT LEAST 3 charts:
-
-- ALWAYS: adk_generate_correlation_heatmap(title=“Feature Correlation Matrix”)
-- ALWAYS: adk_generate_scatter_chart(x_feature=“duration”, y_feature=“gain”, color_by=“popularity”)
-- PLUS 1-2 more chosen from STEP B guidance above
+ANALYSIS STEPS — follow in order:
+1. Call adk_parallel_analyze() — runs feature statistics AND correlations simultaneously
+2. Call adk_compute_derived_metrics() — explicit rate, artist diversity, release recency,
+   duration buckets, rank-tier comparisons
+3. If any |correlation| > 0.15 or interesting pattern found, dig deeper:
+   adk_run_python_analysis(code="result = {'finding': ...}")
+4. Call adk_detect_clusters(n_clusters=3)
+5. Generate AT LEAST 3 charts — ALWAYS include:
+   a. adk_generate_correlation_heatmap(title="Feature Correlation Matrix")
+   b. adk_generate_scatter_chart(x_feature="duration", y_feature="gain", color_by="popularity")
+   Then 1-2 more from histogram, bar_chart, trend_line, radar_chart.
 
 For representative_tracks, pick 6-8 tracks from the track_index provided.
 Copy name, artist, deezer_id EXACTLY. Leave preview_url/deezer_url/album_art empty.
@@ -574,32 +485,30 @@ Formatting: wrap key numbers in **double asterisks** so they render bold.
 
 Output ONLY this JSON (no prose, no fences):
 {
-“findings”: [
-{
-“id”: 1,
-“category”: “tempo_pattern|popularity_driver|genre_characteristic|duration_trend|anomaly|cluster”,
-“finding”: “”,
-“evidence”: {}
-}
-],
-“charts”: [],
-“representative_tracks”: [
-{
-“name”: “”,
-“artist”: “”,
-“deezer_id”: 0,
-“preview_url”: “”,
-“deezer_url”: “”,
-“album_art”: “”,
-“why_representative”: “”,
-“key_features”: {“duration”: 0, “gain”: 0.0, “popularity”: 0}
-}
-],
-“tracks”: []
+  "findings": [
+    {
+      "id": 1,
+      "category": "tempo_pattern|popularity_driver|genre_characteristic|duration_trend|anomaly|cluster",
+      "finding": "",
+      "evidence": {}
+    }
+  ],
+  "charts": [],
+  "representative_tracks": [
+    {
+      "name": "",
+      "artist": "",
+      "deezer_id": 0,
+      "preview_url": "",
+      "deezer_url": "",
+      "album_art": "",
+      "why_representative": "",
+      "key_features": {"duration": 0, "gain": 0.0, "popularity": 0}
+    }
+  ],
+  "tracks": []
 }
 """
-
-
 
 # ── Refinement prompt — injected when the while-loop triggers a re-run ──────
 EDA_REFINEMENT_SYSTEM = """
@@ -1202,6 +1111,71 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
     return final_result, all_logs
 
 
+def _extract_numbers(text: str) -> set[str]:
+    """
+    Extract all numeric strings from text.
+    Returns original string form + rounded variants for fuzzy matching.
+    e.g. "198.3" → {"198.3", "198.3", "198"}
+    """
+    raw_nums = re.findall(r'-?\d+\.?\d*', text)
+    result: set[str] = set()
+    for n in raw_nums:
+        result.add(n)
+        try:
+            f = float(n)
+            result.add(str(round(f, 1)))
+            result.add(str(int(f)))
+        except ValueError:
+            pass
+    return result
+
+
+def _verify_hypothesis_grounding(
+    hypothesis: dict,
+    eda_findings: list[dict],
+) -> tuple[bool, list[str]]:
+    """
+    CODE-LEVEL grounding check — deterministic Python, no LLM involved.
+
+    Extracts all numbers from EDA findings (the ground-truth pool), then checks
+    whether numbers cited in the hypothesis text can be found in that pool.
+
+    A number is considered "unverified" if:
+      - It appears in the hypothesis or supporting_evidence
+      - It is >= 4 in absolute value (filters out sequence numbers like 1, 2, 3)
+      - It cannot be found in any EDA finding text or evidence dict
+
+    Returns (is_grounded, unverified_numbers).
+    is_grounded = True when unverified_ratio < 0.5
+    (50% threshold tolerates legitimately derived numbers like percentages
+    computed from two EDA values — e.g. "17% shorter" derived from 198s vs 240s)
+    """
+    # Build EDA number pool from all findings text + evidence dicts
+    eda_text = " ".join(
+        f.get("finding", "") + " " + json.dumps(f.get("evidence", {}), default=str)
+        for f in eda_findings
+    )
+    eda_pool = _extract_numbers(eda_text)
+
+    # Collect hypothesis text to verify
+    hyp_text = hypothesis.get("hypothesis", "")
+    for ev in hypothesis.get("supporting_evidence", []):
+        hyp_text += " " + ev.get("point", "") + " " + ev.get("data", "")
+
+    hyp_numbers = _extract_numbers(hyp_text)
+
+    # Only check "meaningful" numbers (>= 4 in absolute value)
+    meaningful = {n for n in hyp_numbers if abs(float(n)) >= 4}
+
+    unverified = [n for n in meaningful if n not in eda_pool]
+
+    # Accept if ≤ 50% of cited numbers are unverifiable
+    ratio = len(unverified) / max(len(meaningful), 1)
+    is_grounded = ratio < 0.5
+
+    return is_grounded, unverified
+
+
 def _build_hyp_msg(question: str, eda_result: dict, collected: dict) -> str:
     """
     Build the hypothesis agent's message.
@@ -1212,21 +1186,24 @@ def _build_hyp_msg(question: str, eda_result: dict, collected: dict) -> str:
     payload = json.dumps(_sanitize(trimmed_eda), default=str)[:10000]
 
     tracks = collected.get("tracks", [])
+    # Cap at 20: HypothesisAgent only needs to pick 5-7 tracks; 20 is more than enough.
+    # Sending all 100 wastes ~2000 tokens with no benefit.
+    _HYP_INDEX_CAP = 20
     track_index = [
         {
-            "i":          i,
-            "id":         t.get("deezer_id"),
-            "name":       t.get("name", ""),
-            "artist":     t.get("artist", ""),
-            "rank":       t.get("rank"),
+            "i":           i,
+            "id":          t.get("deezer_id"),
+            "name":        t.get("name", ""),
+            "artist":      t.get("artist", ""),
+            "rank":        t.get("rank"),
             "has_preview": bool(t.get("preview_url")),
         }
-        for i, t in enumerate(tracks)
+        for i, t in enumerate(tracks[:_HYP_INDEX_CAP])
     ]
     return (
         f"Original user question: {question}\n\n"
         f"EDA findings and representative tracks:\n{payload}\n\n"
-        f"Track index — pick highlight_tracks ONLY from this list "
+        f"Track index (top {_HYP_INDEX_CAP} of {len(tracks)}) — pick highlight_tracks ONLY from this list "
         f"using exact name/artist/deezer_id:\n"
         f"{json.dumps(track_index, default=str)}\n"
         f"Pick 5-7 highlight_tracks. Prefer tracks with has_preview=true."
@@ -1243,18 +1220,23 @@ def run_hypothesis(
     Step 3 — Hypothesize.
 
     TRUE Generator-Critic pattern with feedback loop:
-      Round 1: HypothesisAgent generates hypothesis
-              → HypothesisCriticAgent evaluates (ACCEPT / REJECT)
-              → If REJECT: HypothesisAgent revises with critic feedback
-      Round 2: HypothesisAgent revises
-              → HypothesisCriticAgent re-evaluates
-              → Accept regardless after MAX_CRITIC_ROUNDS
-    The Critic can actually REJECT and force a rewrite — this is not just a
-    one-way handoff.
+      Round 0: HypothesisAgent generates hypothesis
+               → CODE-LEVEL grounding check (_verify_hypothesis_grounding)
+               → HypothesisCriticAgent evaluates (ACCEPT / REJECT)
+               → If REJECT from either: HypothesisAgent revises with feedback
+      Round 1: HypothesisAgent revises
+               → CODE-LEVEL grounding check
+               → HypothesisCriticAgent re-evaluates
+      Round 2: Final revision, accepted regardless.
+
+    The grounding check is deterministic Python — it extracts numbers from EDA
+    findings and verifies that numbers cited in the hypothesis are actually present
+    in the data. This is NOT an LLM check.
     """
     all_logs: list[dict] = []
     hypothesis: dict = {}
     critique: dict = {}
+    eda_findings = eda_result.get("findings", [])
 
     hyp_msg = _build_hyp_msg(question, eda_result, collected)
 
@@ -1263,17 +1245,18 @@ def run_hypothesis(
         if round_num == 0:
             gen_msg = hyp_msg
         else:
-            # Critic rejected — give generator the feedback so it can revise
+            # Critic or grounding check rejected — inject feedback for revision
             gen_msg = (
-                f"Your previous hypothesis was REJECTED by the critic.\n\n"
-                f"Critic issues:\n{json.dumps(critique.get('issues', []), indent=2)}\n\n"
+                f"Your previous hypothesis was REJECTED.\n\n"
+                f"Issues:\n{json.dumps(critique.get('issues', []), indent=2)}\n\n"
                 f"Specific gaps to fix:\n{json.dumps(critique.get('specific_gaps', []), indent=2)}\n\n"
                 f"Previous hypothesis JSON:\n{json.dumps(_sanitize(hypothesis), default=str)}\n\n"
-                f"Revise to fix every issue. Every claim must cite a number from EDA findings.\n\n"
-                f"EDA findings (ground truth):\n"
-                f"{json.dumps(_sanitize(eda_result.get('findings', [])), default=str)}\n\n"
-                f"Track index for highlight_tracks:\n"
-                f"{json.dumps([{'i': i, 'id': t.get('deezer_id'), 'name': t.get('name',''), 'artist': t.get('artist',''), 'rank': t.get('rank'), 'has_preview': bool(t.get('preview_url'))} for i, t in enumerate(collected.get('tracks', []))], default=str)}"
+                f"Revise to fix every issue. Every number you cite MUST appear verbatim "
+                f"in the EDA findings below.\n\n"
+                f"EDA findings (ground truth — only use numbers from here):\n"
+                f"{json.dumps(_sanitize(eda_findings), default=str)}\n\n"
+                f"Track index for highlight_tracks (top 20 of {len(collected.get('tracks', []))}):\n"
+                f"{json.dumps([{'i': i, 'id': t.get('deezer_id'), 'name': t.get('name',''), 'artist': t.get('artist',''), 'rank': t.get('rank'), 'has_preview': bool(t.get('preview_url'))} for i, t in enumerate(collected.get('tracks', [])[:20])], default=str)}"
             )
 
         if progress_cb:
@@ -1292,44 +1275,73 @@ def run_hypothesis(
         all_logs.extend(gen_logs)
         hypothesis = _parse_json(gen_text)
 
-        # ── Critic pass (skip on final round to save a call) ──
-        if round_num < MAX_CRITIC_ROUNDS - 1:
-            critic_msg = (
-                f"EDA findings (ground truth):\n"
-                f"{json.dumps(_sanitize(eda_result.get('findings', [])), default=str)}\n\n"
-                f"Hypothesis to evaluate:\n{json.dumps(_sanitize(hypothesis), default=str)}"
-            )
+        # ── Skip critic+grounding on the final round — accept as-is ──
+        if round_num >= MAX_CRITIC_ROUNDS - 1:
+            break
+
+        # ── CODE-LEVEL grounding check (deterministic, no LLM) ───────
+        is_grounded, unverified = _verify_hypothesis_grounding(hypothesis, eda_findings)
+
+        if not is_grounded:
+            # Grounding failed — build critique directly without calling Critic LLM
+            critique = {
+                "verdict": "REJECT",
+                "issues": [
+                    f"CODE-LEVEL GROUNDING FAILURE: {len(unverified)} number(s) cited in "
+                    f"the hypothesis cannot be found in any EDA finding. "
+                    f"Unverified values: {unverified}. "
+                    f"You must ONLY use numbers that appear in the EDA findings provided."
+                ],
+                "specific_gaps": [
+                    f"Number {n!r} not found in EDA findings" for n in unverified
+                ],
+            }
             if progress_cb:
                 try:
                     progress_cb(
-                        "hypothesis_critique",
-                        f"round {round_num + 1}: critic evaluating",
+                        "hypothesis_grounding_fail",
+                        f"round {round_num + 1}: {len(unverified)} unverified numbers — forcing revision",
                     )
                 except Exception:
                     pass
+            # Skip LLM Critic this round — grounding failure is enough to reject
+            continue
 
-            critic_agent = _make_critic_agent()
-            crit_text, crit_logs = _run_adk_agent(
-                agent=critic_agent, message=critic_msg, progress_cb=progress_cb
-            )
-            all_logs.extend(crit_logs)
-            critique = _parse_json(crit_text)
+        # ── LLM Critic pass (only reached if grounding check passed) ──
+        critic_msg = (
+            f"EDA findings (ground truth):\n"
+            f"{json.dumps(_sanitize(eda_findings), default=str)}\n\n"
+            f"Hypothesis to evaluate:\n{json.dumps(_sanitize(hypothesis), default=str)}"
+        )
+        if progress_cb:
+            try:
+                progress_cb(
+                    "hypothesis_critique",
+                    f"round {round_num + 1}: grounding ✓ — critic evaluating",
+                )
+            except Exception:
+                pass
 
-            verdict = critique.get("verdict", "ACCEPT").upper()
-            if progress_cb:
-                try:
-                    progress_cb(
-                        "hypothesis_verdict",
-                        f"round {round_num + 1} verdict: {verdict}",
-                    )
-                except Exception:
-                    pass
+        critic_agent = _make_critic_agent()
+        crit_text, crit_logs = _run_adk_agent(
+            agent=critic_agent, message=critic_msg, progress_cb=progress_cb
+        )
+        all_logs.extend(crit_logs)
+        critique = _parse_json(crit_text)
 
-            if verdict == "ACCEPT":
-                # Critic satisfied — no need for further rounds
-                break
-            # If REJECT, loop continues with the critic feedback injected above
-        # If on final round, accept whatever we have
+        verdict = critique.get("verdict", "ACCEPT").upper()
+        if progress_cb:
+            try:
+                progress_cb(
+                    "hypothesis_verdict",
+                    f"round {round_num + 1} verdict: {verdict}",
+                )
+            except Exception:
+                pass
+
+        if verdict == "ACCEPT":
+            break
+        # If REJECT, loop continues — next round uses critique feedback above
 
     return hypothesis, all_logs
 
