@@ -7,11 +7,19 @@ Built on **Google ADK** (`google-adk`) + **Gemini 2.5 Flash via Vertex AI**, ser
 
 -----
 
-## Live URL
+## Deployment
 
-**<https://musicanalyst-32zzvwbxsq-uc.a.run.app>**
+```bash
+gcloud run deploy musicanalyst \
+  --source . \
+  --region us-central1 \
+  --project agentics-ai-488106 \
+  --allow-unauthenticated \
+  --memory 2Gi --cpu 2 --timeout 300 \
+  --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=1,GOOGLE_CLOUD_PROJECT=agentics-ai-488106,GOOGLE_CLOUD_LOCATION=us-central1"
+```
 
-Deployed on Google Cloud Run (us-central1) — no login required, open to the public.
+Live URL: **https://musicanalyst-32zzvwbxsq-uc.a.run.app**
 
 -----
 
@@ -345,22 +353,6 @@ Wikipedia REST API — separate from Deezer, no API key. Two-stage lookup: direc
 |`"What audio patterns define today's top Latin hits?"`           |`get_tag_top_tracks("latin", limit=100)` → `/chart/197/tracks`  |Genre               |
 |`"Are shorter songs more popular on the global chart right now?"`|`get_top_tracks_chart(limit=100)`                               |Yes/No comparison   |
 |`"What patterns show up across today's global top 25 hits?"`     |`get_top_tracks_chart(limit=100)`                               |Global trends       |
-
------
-
-## Deployment
-
-```bash
-gcloud run deploy musicanalyst \
-  --source . \
-  --region us-central1 \
-  --project agentics-ai-488106 \
-  --allow-unauthenticated \
-  --memory 2Gi --cpu 2 --timeout 300 \
-  --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=1,GOOGLE_CLOUD_PROJECT=agentics-ai-488106,GOOGLE_CLOUD_LOCATION=us-central1"
-```
-
-Live URL: **https://musicanalyst-32zzvwbxsq-uc.a.run.app**
 
 -----
 
