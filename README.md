@@ -50,6 +50,34 @@ open http://127.0.0.1:8080
 
 -----
 
+## Project Structure
+
+```
+music-analyst-agent/
+├── Dockerfile
+├── main.py                     # FastAPI: SSE streaming, _backfill_art(), /preview proxy
+├── pyproject.toml
+├── .env                        # Vertex AI config (gitignored)
+├── README.md
+├── agents/
+│   ├── __init__.py
+│   └── orchestrator.py         # 4 LlmAgents, adk_* wrappers, run_*() runners,
+│                               # _finding_is_specific(), iterative refinement loop,
+│                               # generator-critic loop, _direct_deezer_fallback()
+├── tools/
+│   ├── __init__.py
+│   ├── deezer_tools.py         # Deezer API: chart, genre charts, artist/track, _enrich_tracks()
+│   ├── wikipedia_tools.py      # Wikipedia REST API (second data source)
+│   ├── analysis_tools.py       # Stats, correlations, derived metrics, k-means, code execution
+│   ├── chart_tools.py          # Matplotlib charts → base64 PNG (6 types)
+│   └── artifact_tools.py       # save_artifact() → artifacts/
+├── static/
+│   └── index.html              # SSE client, audio player, charts, history, light/dark mode
+└── artifacts/                  # Markdown reports (auto-created, max 5 kept)
+```
+
+-----
+
 ## Environment Variables
 
 All configuration is set in `.env`:
@@ -353,31 +381,3 @@ Wikipedia REST API — separate from Deezer, no API key. Two-stage lookup: direc
 |`"What audio patterns define today's top Latin hits?"`           |`get_tag_top_tracks("latin", limit=100)` → `/chart/197/tracks`  |Genre               |
 |`"Are shorter songs more popular on the global chart right now?"`|`get_top_tracks_chart(limit=100)`                               |Yes/No comparison   |
 |`"What patterns show up across today's global top 25 hits?"`     |`get_top_tracks_chart(limit=100)`                               |Global trends       |
-
------
-
-## Project Structure
-
-```
-music-analyst-agent/
-├── Dockerfile
-├── main.py                     # FastAPI: SSE streaming, _backfill_art(), /preview proxy
-├── pyproject.toml
-├── .env                        # Vertex AI config (gitignored)
-├── README.md
-├── agents/
-│   ├── __init__.py
-│   └── orchestrator.py         # 4 LlmAgents, adk_* wrappers, run_*() runners,
-│                               # _finding_is_specific(), iterative refinement loop,
-│                               # generator-critic loop, _direct_deezer_fallback()
-├── tools/
-│   ├── __init__.py
-│   ├── deezer_tools.py         # Deezer API: chart, genre charts, artist/track, _enrich_tracks()
-│   ├── wikipedia_tools.py      # Wikipedia REST API (second data source)
-│   ├── analysis_tools.py       # Stats, correlations, derived metrics, k-means, code execution
-│   ├── chart_tools.py          # Matplotlib charts → base64 PNG (6 types)
-│   └── artifact_tools.py       # save_artifact() → artifacts/
-├── static/
-│   └── index.html              # SSE client, audio player, charts, history, light/dark mode
-└── artifacts/                  # Markdown reports (auto-created, max 5 kept)
-```
