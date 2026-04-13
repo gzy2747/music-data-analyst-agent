@@ -21,18 +21,24 @@ Deployed on Google Cloud Run (us-central1) — no login required, open to the pu
 # 1. Install dependencies (Python 3.11+ required)
 pip install -e .
 
-# 2. Authenticate with Google Cloud (one-time)
+# 2. Configure environment
+cp .env.example .env
+# Open .env and set GOOGLE_CLOUD_PROJECT to your actual GCP project ID
+
+# 3. Authenticate with Google Cloud (one-time)
 gcloud auth login
 gcloud auth application-default login
 
-# 3. Start the server
+# 4. Start the server
 python main.py
 
-# 4. Open in browser
+# 5. Open in browser
 open http://127.0.0.1:8080
 ```
 
 > No API keys needed — the app uses **Vertex AI** via your Google Cloud account and **Deezer’s public API** (no key required).
+> 
+> **Important:** Step 2 is required. Without a `.env` file setting `GOOGLE_GENAI_USE_VERTEXAI=1`, the library falls back to the Gemini API and will error with "No API key provided".
 
 -----
 
