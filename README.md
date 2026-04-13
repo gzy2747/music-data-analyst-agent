@@ -290,45 +290,45 @@ The hypothesis is grounded in EDA findings only — `HYPOTHESIS_SYSTEM` explicit
 
 -----
 
-## Grab-Bag Electives
+## Grab-Bag Electives Explanations
 
-### 1. Iterative Refinement Loop ✅
+### 1. Iterative Refinement Loop
 
 **File:** `agents/orchestrator.py` → `run_eda()`, `_finding_is_specific()`, `_build_eda_refinement_msg()`
 
 The agent queries, analyzes, identifies gaps in its understanding, and queries again until the stopping condition (`MIN_SPECIFIC_FINDINGS = 3` numeric findings) is met or `MAX_EDA_ITERATIONS = 3` is reached. A distinct agent instance with `EDA_REFINEMENT_SYSTEM` is used for each refinement pass.
 
-### 2. Parallel Execution ✅
+### 2. Parallel Execution
 
 **File:** `agents/orchestrator.py` → `adk_parallel_analyze()`
 
 `ThreadPoolExecutor(max_workers=2)` submits `compute_feature_statistics` and `compute_feature_correlations` simultaneously. Both futures submitted before either is awaited; results combined into one JSON response.
 
-### 3. Code Execution ✅
+### 3. Code Execution
 
 **File:** `tools/analysis_tools.py` → `run_python_analysis()`, wrapped as `adk_run_python_analysis(code)`
 
 EDAAgent writes pandas/numpy code as a string; executed via `exec(textwrap.dedent(code))`. Pre-injected: `df`, `pd`, `np`, `stats`. Agent sets `result = {...}`; returned as JSON.
 
-### 4. Data Visualization ✅
+### 4. Data Visualization
 
 **File:** `tools/chart_tools.py`
 
 Six chart types (scatter, heatmap, histogram, radar, bar, trend line) rendered as 200 dpi base64 PNG via `matplotlib`. Model receives only `{"stored": True}` — base64 never enters model context. Frontend renders charts 2-per-row with color-coded type badges.
 
-### 5. Artifacts ✅
+### 5. Artifacts
 
 **File:** `tools/artifact_tools.py` → `save_artifact(name, content, kind)`
 
 `HypothesisAgent` writes full markdown reports to `artifacts/`. Auto-prunes to `_MAX_ARTIFACTS = 5`. Downloadable via `/artifacts` and `/artifact/{filename}` in `main.py`.
 
-### 6. Structured Output ✅
+### 6. Structured Output
 
 **File:** `agents/orchestrator.py` → `_parse_json()`, all `run_*()` functions
 
 Every agent outputs only valid JSON (enforced by system prompt). `_parse_json()` strips markdown fences, calls `json.loads()`, falls back to `\{.*\}` regex. Typed dicts passed between all pipeline stages via typed SSE events.
 
-### 7. Second Independent Data Source ✅
+### 7. Second Independent Data Source
 
 **File:** `tools/wikipedia_tools.py`
 
