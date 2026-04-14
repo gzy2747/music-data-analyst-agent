@@ -47,6 +47,8 @@ open http://127.0.0.1:8080
 > No API keys needed — the app uses **Vertex AI** via your Google Cloud account and **Deezer’s public API** (no key required).
 > 
 > **Important:** Step 2 is required. Without a `.env` file setting `GOOGLE_GENAI_USE_VERTEXAI=1`, the library falls back to the Gemini API and will error with "No API key provided".
+>
+> **Local runs are slower than the deployed version** because each Vertex AI call travels over the internet (~1–3s round-trip), whereas Cloud Run runs in the same region (us-central1) as Vertex AI. Add `FAST_MODE=1` to your `.env` to reduce EDA and critic iterations for faster local testing — do not set this in production.
 
 -----
 

@@ -13,7 +13,7 @@ Tools provided:
 
 from __future__ import annotations
 
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import requests
@@ -53,29 +53,35 @@ def _parse_track(item: dict) -> dict:
     }
 
 
+def _enrich_one(t: dict) -> None:
+    """Fetch /track/{id} for a single track and merge fields in-place."""
+    tid = t.get("deezer_id")
+    if not tid:
+        return
+    try:
+        detail = _get(f"/track/{tid}")
+        album = detail.get("album", {})
+        if isinstance(album, dict):
+            art = album.get("cover_xl") or album.get("cover_big") or album.get("cover_medium") or ""
+            if art:
+                t["album_art"] = art
+        gain = detail.get("gain")
+        if gain is not None:
+            t["gain"] = float(gain)
+        rd = detail.get("release_date")
+        if rd:
+            t["release_date"] = rd
+        t["explicit"] = bool(detail.get("explicit_lyrics", False))
+    except Exception:
+        pass
+
+
 def _enrich_tracks(tracks: list[dict]) -> list[dict]:
-    """Fetch /track/{id} for each track and merge gain, release_date, album_art in-place."""
-    for t in tracks:
-        tid = t.get("deezer_id")
-        if not tid:
-            continue
-        try:
-            detail = _get(f"/track/{tid}")
-            album = detail.get("album", {})
-            if isinstance(album, dict):
-                art = album.get("cover_xl") or album.get("cover_big") or album.get("cover_medium") or ""
-                if art:
-                    t["album_art"] = art
-            gain = detail.get("gain")
-            if gain is not None:
-                t["gain"] = float(gain)
-            rd = detail.get("release_date")
-            if rd:
-                t["release_date"] = rd
-            t["explicit"] = bool(detail.get("explicit_lyrics", False))
-            time.sleep(0.01)
-        except Exception:
-            pass
+    """Fetch /track/{id} for each track in parallel and merge fields in-place."""
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futures = [pool.submit(_enrich_one, t) for t in tracks]
+        for f in as_completed(futures):
+            f.result()
     return tracks
 
 
@@ -235,8 +241,7 @@ def get_tracks_details(deezer_ids: list[int]) -> dict[str, Any]:
     { "tracks": [ { "deezer_id", "gain", "album_art", "duration",
                     "release_date", "explicit" } ], "count": int }
     """
-    results = []
-    for track_id in deezer_ids[:100]:
+    def _fetch_one(track_id: int) -> dict:
         try:
             detail = _get(f"/track/{track_id}")
             album = detail.get("album", {})
@@ -244,20 +249,26 @@ def get_tracks_details(deezer_ids: list[int]) -> dict[str, Any]:
                 album.get("cover_xl") or album.get("cover_big") or
                 album.get("cover_medium") or ""
             ) if isinstance(album, dict) else ""
-            results.append({
+            return {
                 "deezer_id":    track_id,
                 "gain":         float(detail.get("gain", 0.0)),
                 "album_art":    album_art,
                 "duration":     int(detail.get("duration", 0)),
                 "release_date": detail.get("release_date", ""),
                 "explicit":     bool(detail.get("explicit_lyrics", False)),
-            })
-            time.sleep(0.01)
+            }
         except Exception:
-            results.append({
+            return {
                 "deezer_id": track_id, "gain": 0.0, "album_art": "",
                 "duration": 0, "release_date": "", "explicit": False,
-            })
+            }
+
+    ids = deezer_ids[:100]
+    results = [None] * len(ids)
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        future_to_idx = {pool.submit(_fetch_one, tid): i for i, tid in enumerate(ids)}
+        for f in as_completed(future_to_idx):
+            results[future_to_idx[f]] = f.result()
     return {"tracks": results, "count": len(results)}
 
 

@@ -77,11 +77,11 @@ APP_NAME = "musicanalyst"
 # How many critic rounds before we accept whatever we have.
 # Round 0 → generate + critique, Round 1 → revise + critique,
 # Round 2 → final revision, accepted without further critique.
-MAX_CRITIC_ROUNDS = 3
-# How many EDA refinement iterations before we stop
-MAX_EDA_ITERATIONS = 3
-# Minimum number of specific (numeric) findings before EDA is considered done
-MIN_SPECIFIC_FINDINGS = 3
+# Set FAST_MODE=1 in .env to use reduced iterations for local testing.
+_FAST = os.getenv("FAST_MODE", "0") == "1"
+MAX_CRITIC_ROUNDS     = 1 if _FAST else 3
+MAX_EDA_ITERATIONS    = 1 if _FAST else 3
+MIN_SPECIFIC_FINDINGS = 1 if _FAST else 3
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1132,6 +1132,8 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
         )
         all_logs.extend(ref_logs)
         ref_result = _parse_json(ref_text)
+        if isinstance(ref_result, list):
+            ref_result = {"findings": ref_result}
         new_findings = ref_result.get("findings", [])
 
         existing_texts = {f.get("finding", "").strip().lower() for f in all_findings}
