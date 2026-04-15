@@ -130,6 +130,19 @@ def _sanitize(obj: Any) -> Any:
     return obj
 
 
+_LISTING_PATTERNS = re.compile(
+    r"\b(top\s*\d+|what\s+are\s+the\s+top|list\s+(the\s+)?(top|best|current)|"
+    r"show\s+(me\s+)?(the\s+)?(top|best|current)|most\s+popular\s+(songs?|tracks?|hits?)"
+    r"|current\s+(chart|hit|song|track)|today'?s?\s+(top|chart|hit|song|track)"
+    r"|trending\s+(song|track|hit|now)|what'?s?\s+(hot|trending|charting|number\s*one))\b",
+    re.IGNORECASE,
+)
+
+def _is_listing_question(question: str) -> bool:
+    """Return True if the question is asking for a ranked list rather than analysis."""
+    return bool(_LISTING_PATTERNS.search(question))
+
+
 def _parse_json(text: str) -> dict:
     """Strip markdown fences and parse JSON; fall back to regex extraction."""
     clean = text.strip()
@@ -795,6 +808,19 @@ def _run_adk_agent(
         if not final_text and all_agent_texts:
             final_text = all_agent_texts[-1].strip()
 
+        # If final_text doesn't contain JSON but an earlier agent turn does,
+        # use that instead. This handles the case where the agent outputs JSON,
+        # then calls adk_save_artifact, then outputs a short non-JSON acknowledgment
+        # as the final response — causing _parse_json to lose the JSON output.
+        def _has_json(t: str) -> bool:
+            return "{" in t and "}" in t
+
+        if not _has_json(final_text):
+            for candidate in reversed(all_agent_texts):
+                if _has_json(candidate):
+                    final_text = candidate.strip()
+                    break
+
         return final_text, tool_log
 
     import time as _time
@@ -995,8 +1021,19 @@ def _build_eda_initial_msg(question: str, tracks: list[dict]) -> str:
         for i, t in enumerate(tracks[:_INDEX_CAP])
     ]
 
+    listing_hint = (
+        "\n⚠ LISTING QUESTION DETECTED: The user wants a ranked list, not deep analysis.\n"
+        "→ Skip clusters and deep correlations. Instead:\n"
+        "  1. Call adk_compute_feature_statistics() for basic stats.\n"
+        "  2. Produce 2-3 light findings (e.g. avg duration, explicit rate, newest release).\n"
+        "  3. Pick representative_tracks = the top 10 tracks by rank (rank 1–10).\n"
+        "  4. Generate ONE bar chart showing the top 10 tracks by rank.\n"
+        "Findings should read like: 'The top 10 tracks average **213s** in duration.'\n"
+    ) if _is_listing_question(question) else ""
+
     return (
         f"Original question: {question}\n\n"
+        f"{listing_hint}"
         f"Dataset loaded in analysis tools: {n} tracks\n"
         f"Schema fields: {schema_fields}\n\n"
         f"Aggregate stats (for orientation only — use tools for full analysis):\n"
@@ -1100,8 +1137,10 @@ def run_eda(collected: dict, question: str, progress_cb=None) -> tuple[dict, lis
     all_findings.extend(result.get("findings", []))
 
     # ── CODE-LEVEL refinement while-loop ──────────────────────
+    # Skip refinement for listing questions — a simple chart is sufficient.
     iteration = 0
-    while iteration < MAX_EDA_ITERATIONS:
+    _skip_refinement = _is_listing_question(question)
+    while not _skip_refinement and iteration < MAX_EDA_ITERATIONS:
         specific = [f for f in all_findings if _finding_is_specific(f)]
         if len(specific) >= MIN_SPECIFIC_FINDINGS:
             break
@@ -1211,7 +1250,24 @@ def _build_hyp_msg(question: str, eda_result: dict, collected: dict) -> str:
     payload = json.dumps(_sanitize(trimmed_eda), default=str)[:10000]
 
     tracks = collected.get("tracks", [])
+
+    # Build set of deezer_ids already used as representative_tracks in EDA
+    rep_ids = {
+        t.get("deezer_id")
+        for t in eda_result.get("representative_tracks", [])
+        if t.get("deezer_id")
+    }
+    rep_names = {
+        (t.get("name", "").lower(), t.get("artist", "").lower())
+        for t in eda_result.get("representative_tracks", [])
+    }
+
     _HYP_INDEX_CAP = 20
+    # Prefer tracks NOT already shown as representative_tracks; fill up to cap if needed
+    non_rep = [t for t in tracks if t.get("deezer_id") not in rep_ids
+               and (t.get("name","").lower(), t.get("artist","").lower()) not in rep_names]
+    pool = (non_rep + [t for t in tracks if t.get("deezer_id") in rep_ids])[:_HYP_INDEX_CAP]
+
     track_index = [
         {
             "i":           i,
@@ -1221,13 +1277,30 @@ def _build_hyp_msg(question: str, eda_result: dict, collected: dict) -> str:
             "rank":        t.get("rank"),
             "has_preview": bool(t.get("preview_url")),
         }
-        for i, t in enumerate(tracks[:_HYP_INDEX_CAP])
+        for i, t in enumerate(pool)
     ]
+
+    listing_hint = (
+        "\n⚠ LISTING QUESTION: The user wants a ranked list. "
+        "Set direct_answer to a 1-2 sentence intro (e.g. 'Here are today\\'s top 10 songs on the global chart.'). "
+        "For hypothesis, briefly note 1-2 patterns across the top tracks (avg duration, dominant artists, etc.). "
+        "Pick highlight_tracks = the top 10 tracks by rank (rank 1 first). "
+        "Set why_this_track to '#[rank] on the chart today'.\n"
+    ) if _is_listing_question(question) else ""
+
+    already_shown = (
+        f"\n⚠ These tracks are already shown as EDA Representative Tracks — "
+        f"DO NOT pick them again for highlight_tracks: "
+        f"{[t.get('name','') for t in eda_result.get('representative_tracks', [])]}\n"
+    ) if rep_ids and not _is_listing_question(question) else ""
+
     return (
         f"Original user question: {question}\n\n"
+        f"{listing_hint}"
+        f"{already_shown}"
         f"EDA findings and representative tracks:\n{payload}\n\n"
-        f"Track index (top {_HYP_INDEX_CAP} of {len(tracks)}) — pick highlight_tracks ONLY from this list "
-        f"using exact name/artist/deezer_id:\n"
+        f"Track index (top {_HYP_INDEX_CAP} of {len(tracks)}, non-overlapping tracks first) — "
+        f"pick highlight_tracks ONLY from this list using exact name/artist/deezer_id:\n"
         f"{json.dumps(track_index, default=str)}\n"
         f"Pick 5-7 highlight_tracks. Prefer tracks with has_preview=true."
     )

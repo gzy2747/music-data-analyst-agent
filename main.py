@@ -312,26 +312,50 @@ async def stream_pipeline(question: str) -> AsyncIterator[str]:
         all_logs = collect_logs + eda_logs + hyp_logs
         yield _sse("tool_log", {"calls": all_logs})
 
-        # If agent omitted highlight_tracks, fall back to top tracks from collected data
+        # Build rep set for dedup (by deezer_id and name+artist)
+        rep_ids_used = {
+            t.get("deezer_id")
+            for t in eda.get("representative_tracks", [])
+            if t.get("deezer_id")
+        }
+        rep_names_used = {
+            (t.get("name", "").lower().strip(), t.get("artist", "").lower().strip())
+            for t in eda.get("representative_tracks", [])
+        }
+
+        def _is_rep(t: dict) -> bool:
+            return (
+                t.get("deezer_id") in rep_ids_used
+                or (t.get("name", "").lower().strip(), t.get("artist", "").lower().strip()) in rep_names_used
+            )
+
+        # Server-side dedup: remove highlight_tracks that overlap with representative_tracks,
+        # then fill up to 6 from collected tracks not already shown
         hl = hypothesis.get("highlight_tracks") or []
-        if not hl and tracks:
-            hl = [
-                {
-                    "name": t.get("name", ""),
-                    "artist": t.get("artist", ""),
-                    "deezer_id": t.get("deezer_id"),
-                    "preview_url": t.get("preview_url", ""),
-                    "deezer_url": t.get("deezer_url", ""),
-                    "album_art": t.get("album_art", ""),
-                    "why_this_track": f"Rank #{t.get('rank', '?')} on the chart",
-                    "key_features": {
-                        "duration": t.get("duration", 0),
-                        "gain": t.get("gain", 0.0),
-                        "popularity": t.get("popularity", 0),
-                    },
-                }
-                for t in tracks[:6]
-            ]
+        hl = _backfill_art([t for t in hl if not _is_rep(t)])
+
+        if len(hl) < 4:
+            filler_pool = [t for t in tracks if not _is_rep(t)]
+            existing_ids = {t.get("deezer_id") for t in hl}
+            for t in filler_pool:
+                if len(hl) >= 6:
+                    break
+                if t.get("deezer_id") not in existing_ids:
+                    hl.append({
+                        "name": t.get("name", ""),
+                        "artist": t.get("artist", ""),
+                        "deezer_id": t.get("deezer_id"),
+                        "preview_url": t.get("preview_url", ""),
+                        "deezer_url": t.get("deezer_url", ""),
+                        "album_art": t.get("album_art", ""),
+                        "why_this_track": f"Rank #{t.get('rank', '?')} on the chart",
+                        "key_features": {
+                            "duration": t.get("duration", 0),
+                            "gain": t.get("gain", 0.0),
+                            "popularity": t.get("popularity", 0),
+                        },
+                    })
+                    existing_ids.add(t.get("deezer_id"))
 
         yield _sse("hypothesis_done", {
             "direct_answer": hypothesis.get("direct_answer", ""),
@@ -341,7 +365,7 @@ async def stream_pipeline(question: str) -> AsyncIterator[str]:
             "supporting_evidence": hypothesis.get("supporting_evidence", []),
             "alternative_explanations": hypothesis.get("alternative_explanations", []),
             "summary_paragraph": hypothesis.get("summary_paragraph", ""),
-            "highlight_tracks": _backfill_art(hl),
+            "highlight_tracks": hl,
             "artifact_path": hypothesis.get("artifact_path", ""),
             "tool_calls": len(hyp_logs),
         })

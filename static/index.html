@@ -958,7 +958,7 @@ function renderResults(eD,hD,allLogs){
   const evidence =hD?.supporting_evidence||[];
   const alts     =hD?.alternative_explanations||[];
   const _repKeys=new Set(repTracks.map(t=>(t.name||'').toLowerCase()+'|'+(t.artist||'').toLowerCase()));
-  const hlTracks=(hD?.highlight_tracks||[]).filter(t=>!_repKeys.has((t.name||'').toLowerCase()+'|'+(t.artist||'').toLowerCase()));
+  const hlTracksDisplay=hD?.highlight_tracks||[];
   const directAnswer=(hD?.direct_answer||'').trim();
   const conf=(hD?.confidence||'medium').toLowerCase();
   let h='';
@@ -1067,10 +1067,10 @@ function renderResults(eD,hD,allLogs){
   }
 
   // Highlight tracks — Step 3 · Illustrate the Hypothesis
-  if(hlTracks.length){
+  if(hlTracksDisplay.length){
     h+=`<div class="tracks-sec">
       <div class="rsh"><div class="rsh-title">Highlight Tracks</div><div class="rsh-sub">Step 3 · Illustrate the Hypothesis</div><div class="rsh-line"></div></div>
-      ${tracksSectionHTML(hlTracks, t=>t.why_this_track)}
+      ${tracksSectionHTML(hlTracksDisplay, t=>t.why_this_track)}
     </div>`;
   }
 
