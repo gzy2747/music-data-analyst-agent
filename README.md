@@ -9,14 +9,16 @@ Built on **Google ADK** (`google-adk`) + **Gemini 2.5 Flash via Vertex AI**, ser
 
 ## Deployment
 
+> Replace `YOUR_GCP_PROJECT_ID` with your actual GCP project ID before running.
+
 ```bash
 gcloud run deploy musicanalyst \
   --source . \
   --region us-central1 \
-  --project agentics-ai-488106 \
+  --project YOUR_GCP_PROJECT_ID \   
   --allow-unauthenticated \
   --memory 2Gi --cpu 2 --timeout 300 \
-  --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=1,GOOGLE_CLOUD_PROJECT=agentics-ai-488106,GOOGLE_CLOUD_LOCATION=us-central1"
+  --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=1,GOOGLE_CLOUD_PROJECT=YOUR_GCP_PROJECT_ID,GOOGLE_CLOUD_LOCATION=us-central1"
 ```
 
 Live URL: **https://musicanalyst-32zzvwbxsq-uc.a.run.app**
