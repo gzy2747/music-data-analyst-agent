@@ -626,11 +626,6 @@ Output ONLY this JSON (no prose, no fences):
   "hypothesis": "",
   "confidence": "Low|Medium|High",
   "confidence_reasoning": "",
-  "supporting_evidence": [
-    {"point": "", "data": ""}
-  ],
-  "alternative_explanations": ["", ""],
-  "summary_paragraph": "1-2 plain-language sentences for non-technical readers. NO numbers or jargon.",
   "highlight_tracks": [
     {
       "name": "",
@@ -643,6 +638,11 @@ Output ONLY this JSON (no prose, no fences):
       "key_features": {"duration": 0, "gain": 0.0, "popularity": 0}
     }
   ],
+  "supporting_evidence": [
+    {"point": "", "data": ""}
+  ],
+  "alternative_explanations": ["", ""],
+  "summary_paragraph": "1-2 plain-language sentences for non-technical readers. NO numbers or jargon.",
   "artifact_path": ""
 }
 """
